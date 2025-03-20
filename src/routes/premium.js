@@ -2,79 +2,227 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth.js';
 import { pool } from '../db/init.js';
 import { v4 as uuidv4 } from 'uuid';
-import { mailTransporter } from '../index.js';
-import analyticsRoutes from './premium/analytics.js';
-import webhooksRoutes from './premium/webhooks.js';
-import templatesRoutes from './premium/templates.js';
-import backupsRoutes from './premium/backups.js';
 
 const router = express.Router();
 
-// Use premium sub-routes
-router.use('/analytics', analyticsRoutes);
-router.use('/webhooks', webhooksRoutes);
-router.use('/templates', templatesRoutes);
-router.use('/backups', backupsRoutes);
-
-// Set up email forwarding
-router.post('/emails/:id/forward', authenticateToken, async (req, res) => {
+// Get all emails (both premium and regular)
+router.get('/emails', authenticateToken, async (req, res) => {
   const connection = await pool.getConnection();
   try {
-    const { forwardTo } = req.body;
-    
-    // Validate email format
-    if (!forwardTo || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(forwardTo)) {
-      return res.status(400).json({ error: 'Invalid forwarding email address' });
-    }
+    // Get pagination parameters
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+    const search = req.query.search || '';
 
-    // Verify email ownership
-    const [email] = await connection.query(
-      'SELECT * FROM premium_emails WHERE id = ? AND user_id = ?',
-      [req.params.id, req.user.id]
+    // Get premium emails
+    const [premiumEmails] = await connection.query(
+      `SELECT pe.*, cd.domain 
+       FROM premium_emails pe
+       JOIN custom_domains cd ON pe.domain_id = cd.id
+       WHERE pe.user_id = ? AND pe.email LIKE ?
+       ORDER BY pe.created_at DESC
+       LIMIT ? OFFSET ?`,
+      [req.user.id, `%${search}%`, limit, offset]
     );
 
-    if (!email.length) {
-      return res.status(404).json({ error: 'Email not found' });
-    }
-
-    // Update forwarding address
-    await connection.query(
-      'UPDATE premium_emails SET forward_to = ? WHERE id = ?',
-      [forwardTo, req.params.id]
+    // Get total count
+    const [totalCount] = await connection.query(
+      `SELECT COUNT(*) as total 
+       FROM premium_emails 
+       WHERE user_id = ? AND email LIKE ?`,
+      [req.user.id, `%${search}%`]
     );
 
-    // Test forwarding setup
-    try {
-      await mailTransporter.sendMail({
-        from: `"Boomlify Forward Test" <${email[0].email}>`,
-        to: forwardTo,
-        subject: 'Email Forwarding Test',
-        html: `
-          <h1>Email Forwarding Test</h1>
-          <p>This is a test email to confirm your forwarding setup is working correctly.</p>
-          <p>You will now receive all emails sent to ${email[0].email} at this address.</p>
-        `
-      });
-    } catch (error) {
-      console.error('Forward test failed:', error);
-      // Continue even if test fails - don't block setup
-    }
+    // Get regular emails
+    const [regularEmails] = await connection.query(
+      `SELECT * FROM temp_emails 
+       WHERE user_id = ? AND email LIKE ?
+       ORDER BY created_at DESC`,
+      [req.user.id, `%${search}%`]
+    );
 
-    res.json({ message: 'Email forwarding set up successfully' });
+    // Combine and format response
+    const allEmails = [
+      ...premiumEmails.map(email => ({
+        ...email,
+        type: 'premium'
+      })),
+      ...regularEmails.map(email => ({
+        ...email,
+        type: 'regular'
+      }))
+    ];
+
+    res.json({
+      data: allEmails,
+      metadata: {
+        total: totalCount[0].total,
+        page,
+        limit,
+        pages: Math.ceil(totalCount[0].total / limit)
+      }
+    });
+
   } catch (error) {
-    console.error('Failed to set up forwarding:', error);
-    res.status(500).json({ error: 'Failed to set up email forwarding' });
+    console.error('Failed to fetch emails:', error);
+    res.status(500).json({ error: 'Failed to fetch emails' });
   } finally {
     connection.release();
   }
 });
 
-// Remove email forwarding
-router.delete('/emails/:id/forward', authenticateToken, async (req, res) => {
+// Get custom domains
+router.get('/domains', authenticateToken, async (req, res) => {
   const connection = await pool.getConnection();
   try {
-    const [result] = await connection.query(
-      'UPDATE premium_emails SET forward_to = NULL WHERE id = ? AND user_id = ?',
+    const [domains] = await connection.query(
+      'SELECT * FROM custom_domains WHERE user_id = ? ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json(domains);
+  } catch (error) {
+    console.error('Failed to fetch domains:', error);
+    res.status(500).json({ error: 'Failed to fetch domains' });
+  } finally {
+    connection.release();
+  }
+});
+
+// Add custom domain
+router.post('/domains', authenticateToken, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const { domain } = req.body;
+    
+    // Basic validation
+    if (!domain || !/^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$/.test(domain)) {
+      return res.status(400).json({ error: 'Invalid domain format' });
+    }
+
+    // Check if domain already exists
+    const [existing] = await connection.query(
+      'SELECT id FROM custom_domains WHERE domain = ?',
+      [domain]
+    );
+
+    if (existing.length > 0) {
+      return res.status(409).json({ error: 'Domain already exists' });
+    }
+
+    // Add domain with pending status
+    const id = uuidv4();
+    await connection.query(
+      `INSERT INTO custom_domains (
+        id, user_id, domain, status, created_at
+      ) VALUES (?, ?, ?, 'pending', NOW())`,
+      [id, req.user.id, domain]
+    );
+
+    // Return the new domain
+    const [newDomain] = await connection.query(
+      'SELECT * FROM custom_domains WHERE id = ?',
+      [id]
+    );
+
+    res.json(newDomain[0]);
+  } catch (error) {
+    console.error('Failed to add domain:', error);
+    res.status(500).json({ error: 'Failed to add domain' });
+  } finally {
+    connection.release();
+  }
+});
+
+// Verify domain DNS settings
+router.post('/domains/:id/verify', authenticateToken, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const [domain] = await connection.query(
+      'SELECT * FROM custom_domains WHERE id = ? AND user_id = ?',
+      [req.params.id, req.user.id]
+    );
+
+    if (!domain.length) {
+      return res.status(404).json({ error: 'Domain not found' });
+    }
+
+    // Verify DNS settings
+    const verification = await verifyDNSSettings(domain[0].domain);
+    
+    await connection.query(
+      `UPDATE custom_domains 
+       SET status = ?, 
+           verified_at = ?,
+           last_check_at = NOW(),
+           dns_check_results = ?
+       WHERE id = ?`,
+      [
+        verification.isValid ? 'verified' : 'failed',
+        verification.isValid ? new Date() : null,
+        JSON.stringify(verification.checks),
+        req.params.id
+      ]
+    );
+
+    res.json({
+      status: verification.isValid ? 'verified' : 'failed',
+      checks: verification.checks
+    });
+  } catch (error) {
+    console.error('Failed to verify domain:', error);
+    res.status(500).json({ error: 'Failed to verify domain' });
+  } finally {
+    connection.release();
+  }
+});
+
+// Create premium email
+router.post('/emails', authenticateToken, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const { email, domainId } = req.body;
+
+    // Validate domain ownership
+    const [domain] = await connection.query(
+      'SELECT * FROM custom_domains WHERE id = ? AND user_id = ? AND status = ?',
+      [domainId, req.user.id, 'verified']
+    );
+
+    if (!domain.length) {
+      return res.status(403).json({ error: 'Invalid or unverified domain' });
+    }
+
+    // Create premium email
+    const id = uuidv4();
+    await connection.query(
+      `INSERT INTO premium_emails (
+        id, user_id, email, domain_id, expires_at, created_at
+      ) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 3 MONTH), NOW())`,
+      [id, req.user.id, email, domainId]
+    );
+
+    const [newEmail] = await connection.query(
+      'SELECT * FROM premium_emails WHERE id = ?',
+      [id]
+    );
+
+    res.json(newEmail[0]);
+  } catch (error) {
+    console.error('Failed to create email:', error);
+    res.status(500).json({ error: 'Failed to create email' });
+  } finally {
+    connection.release();
+  }
+});
+
+// Delete premium email
+router.delete('/emails/:id', authenticateToken, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    // Delete email and all associated data
+    const result = await connection.query(
+      'DELETE FROM premium_emails WHERE id = ? AND user_id = ?',
       [req.params.id, req.user.id]
     );
 
@@ -82,175 +230,73 @@ router.delete('/emails/:id/forward', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Email not found' });
     }
 
-    res.json({ message: 'Email forwarding removed successfully' });
+    res.json({ message: 'Email deleted successfully' });
   } catch (error) {
-    console.error('Failed to remove forwarding:', error);
-    res.status(500).json({ error: 'Failed to remove email forwarding' });
+    console.error('Failed to delete email:', error);
+    res.status(500).json({ error: 'Failed to delete email' });
   } finally {
     connection.release();
   }
 });
 
-// Get forwarding status
-router.get('/emails/:id/forward', authenticateToken, async (req, res) => {
+// Upgrade regular email to premium
+router.post('/emails/upgrade/:id', authenticateToken, async (req, res) => {
   const connection = await pool.getConnection();
   try {
-    const [email] = await connection.query(
-      'SELECT forward_to FROM premium_emails WHERE id = ? AND user_id = ?',
+    const { domainId } = req.body;
+
+    // Verify domain ownership and status
+    const [domain] = await connection.query(
+      'SELECT * FROM custom_domains WHERE id = ? AND user_id = ? AND status = ?',
+      [domainId, req.user.id, 'verified']
+    );
+
+    if (!domain.length) {
+      return res.status(403).json({ error: 'Invalid or unverified domain' });
+    }
+
+    // Get regular email
+    const [regularEmail] = await connection.query(
+      'SELECT * FROM temp_emails WHERE id = ? AND user_id = ?',
       [req.params.id, req.user.id]
     );
 
-    if (!email.length) {
+    if (!regularEmail.length) {
       return res.status(404).json({ error: 'Email not found' });
     }
 
-    res.json({
-      forwardingEnabled: !!email[0].forward_to,
-      forwardTo: email[0].forward_to
-    });
-  } catch (error) {
-    console.error('Failed to get forwarding status:', error);
-    res.status(500).json({ error: 'Failed to get forwarding status' });
-  } finally {
-    connection.release();
-  }
-});
+    // Create premium email
+    const id = uuidv4();
+    const newEmail = `${regularEmail[0].email.split('@')[0]}@${domain[0].domain}`;
 
-// Get premium status
-router.get('/status', authenticateToken, async (req, res) => {
-  const connection = await pool.getConnection();
-  try {
-    const [user] = await connection.query(
-      'SELECT premium_tier, premium_features, premium_limits FROM users WHERE id = ?',
-      [req.user.id]
-    );
+    await connection.beginTransaction();
 
-    if (!user.length) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    res.json(user[0]);
-  } catch (error) {
-    console.error('Failed to fetch premium status:', error);
-    res.status(500).json({ error: 'Failed to fetch premium status' });
-  } finally {
-    connection.release();
-  }
-});
-
-// Get premium usage stats
-router.get('/usage', authenticateToken, async (req, res) => {
-  const connection = await pool.getConnection();
-  try {
-    // Get email counts
-    const [emailCounts] = await connection.query(
-      `SELECT 
-        COUNT(DISTINCT pe.id) as total_emails,
-        COUNT(DISTINCT cd.id) as total_domains,
-        COUNT(DISTINCT pre.id) as total_received,
-        COUNT(DISTINCT CASE WHEN pe.forward_to IS NOT NULL THEN pe.id END) as forwarded_emails
-       FROM premium_emails pe
-       LEFT JOIN custom_domains cd ON pe.domain_id = cd.id
-       LEFT JOIN premium_received_emails pre ON pe.id = pre.premium_email_id
-       WHERE pe.user_id = ?`,
-      [req.user.id]
-    );
-
-    // Get storage usage
-    const [storageUsage] = await connection.query(
-      `SELECT 
-        SUM(CHAR_LENGTH(pre.body_html) + CHAR_LENGTH(pre.body_text)) as email_size,
-        COUNT(pea.id) as attachment_count,
-        SUM(pea.size) as attachment_size
-       FROM premium_received_emails pre
-       LEFT JOIN premium_email_attachments pea ON pre.id = pea.email_id
-       WHERE pre.premium_email_id IN (
-         SELECT id FROM premium_emails WHERE user_id = ?
-       )`,
-      [req.user.id]
-    );
-
-    res.json({
-      emails: {
-        ...emailCounts[0],
-        forwarded: emailCounts[0].forwarded_emails || 0
-      },
-      storage: {
-        emailSize: storageUsage[0].email_size || 0,
-        attachmentCount: storageUsage[0].attachment_count || 0,
-        attachmentSize: storageUsage[0].attachment_size || 0,
-        totalSize: (storageUsage[0].email_size || 0) + (storageUsage[0].attachment_size || 0)
-      }
-    });
-  } catch (error) {
-    console.error('Failed to fetch usage stats:', error);
-    res.status(500).json({ error: 'Failed to fetch usage stats' });
-  } finally {
-    connection.release();
-  }
-});
-
-// Update premium settings
-router.put('/settings', authenticateToken, async (req, res) => {
-  const connection = await pool.getConnection();
-  try {
-    const { features } = req.body;
-    
+    // Insert premium email
     await connection.query(
-      'UPDATE users SET premium_features = ? WHERE id = ?',
-      [JSON.stringify(features), req.user.id]
+      `INSERT INTO premium_emails (
+        id, user_id, email, domain_id, expires_at, created_at
+      ) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 3 MONTH), NOW())`,
+      [id, req.user.id, newEmail, domainId]
     );
 
-    res.json({ message: 'Settings updated successfully' });
+    // Delete regular email
+    await connection.query(
+      'DELETE FROM temp_emails WHERE id = ?',
+      [req.params.id]
+    );
+
+    await connection.commit();
+
+    const [upgradedEmail] = await connection.query(
+      'SELECT * FROM premium_emails WHERE id = ?',
+      [id]
+    );
+
+    res.json(upgradedEmail[0]);
   } catch (error) {
-    console.error('Failed to update settings:', error);
-    res.status(500).json({ error: 'Failed to update settings' });
-  } finally {
-    connection.release();
-  }
-});
-
-// Get premium limits
-router.get('/limits', authenticateToken, async (req, res) => {
-  const connection = await pool.getConnection();
-  try {
-    const [user] = await connection.query(
-      'SELECT premium_limits FROM users WHERE id = ?',
-      [req.user.id]
-    );
-
-    if (!user.length) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    const limits = JSON.parse(user[0].premium_limits || '{}');
-    
-    // Get current usage
-    const [usage] = await connection.query(
-      `SELECT 
-        COUNT(DISTINCT pe.id) as email_count,
-        COUNT(DISTINCT cd.id) as domain_count,
-        SUM(CHAR_LENGTH(pre.body_html) + CHAR_LENGTH(pre.body_text)) as storage_used,
-        COUNT(DISTINCT CASE WHEN pe.forward_to IS NOT NULL THEN pe.id END) as forwarding_count
-       FROM premium_emails pe
-       LEFT JOIN custom_domains cd ON pe.domain_id = cd.id
-       LEFT JOIN premium_received_emails pre ON pe.id = pre.premium_email_id
-       WHERE pe.user_id = ?`,
-      [req.user.id]
-    );
-
-    res.json({
-      limits,
-      usage: {
-        emails: usage[0].email_count || 0,
-        domains: usage[0].domain_count || 0,
-        storage: usage[0].storage_used || 0,
-        forwarding: usage[0].forwarding_count || 0
-      }
-    });
-  } catch (error) {
-    console.error('Failed to fetch limits:', error);
-    res.status(500).json({ error: 'Failed to fetch limits' });
+    await connection.rollback();
+    console.error('Failed to upgrade email:', error);
+    res.status(500).json({ error: 'Failed to upgrade email' });
   } finally {
     connection.release();
   }
