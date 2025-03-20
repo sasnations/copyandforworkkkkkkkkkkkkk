@@ -6,7 +6,7 @@ import compression from 'compression';
 import { initializeDatabase, checkDatabaseConnection, pool } from './db/init.js';
 import { cleanupOldEmails } from './utils/cleanup.js';
 import { requestTrackerMiddleware } from './middleware/requestTracker.js';
-import { checkBlockedIp } from './middleware/ipBlocker.js'; // Added import
+import { checkBlockedIp } from './middleware/ipBlocker.js';
 import authRoutes from './routes/auth.js';
 import emailRoutes from './routes/emails.js';
 import domainRoutes from './routes/domains.js';
@@ -14,6 +14,7 @@ import webhookRoutes from './routes/webhook.js';
 import messageRoutes from './routes/messages.js';
 import blogRoutes from './routes/blog.js';
 import monitorRoutes from './routes/monitor.js';
+import premiumRoutes from './routes/premium.js'; // Added premium routes
 import nodemailer from 'nodemailer';
 
 dotenv.config();
@@ -25,13 +26,13 @@ const port = process.env.PORT || 3000;
 export const mailTransporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
   port: parseInt(process.env.SMTP_PORT || '587'),
-  secure: false, // Use TLS
+  secure: false,
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS
   },
   tls: {
-    rejectUnauthorized: false // Only use this in development!
+    rejectUnauthorized: false
   }
 });
 
@@ -67,7 +68,7 @@ app.use(compression());
 app.use(requestTrackerMiddleware);
 
 // Apply IP blocker to all routes except monitor routes
-app.use(/^(?!\/monitor).*$/, checkBlockedIp); // Added IP blocker middleware
+app.use(/^(?!\/monitor).*$/, checkBlockedIp);
 
 // Security headers
 app.use((req, res, next) => {
@@ -115,8 +116,9 @@ app.use('/webhook', webhookRoutes);
 app.use('/messages', messageRoutes);
 app.use('/blog', blogRoutes);
 app.use('/monitor', monitorRoutes);
+app.use('/premium', premiumRoutes); // Added premium routes
 
-// Handle preflight requests for /admin/all
+// Handle preflight requests
 app.options('/emails/admin/all', cors());
 
 // Schedule cleanup
