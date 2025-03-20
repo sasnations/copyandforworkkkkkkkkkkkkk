@@ -2,8 +2,59 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth.js';
 import { pool } from '../db/init.js';
 import { v4 as uuidv4 } from 'uuid';
+import dns from 'dns';
+import { promisify } from 'util';
 
 const router = express.Router();
+const resolveMx = promisify(dns.resolveMx);
+const resolveTxt = promisify(dns.resolveTxt);
+
+// Verify DNS settings for a domain
+async function verifyDNSSettings(domain) {
+  try {
+    // Check MX records
+    const mxRecords = await resolveMx(domain);
+    const hasMxRecords = mxRecords.some(record => 
+      record.exchange.includes('mx1.boomlify.com') || 
+      record.exchange.includes('mx2.boomlify.com')
+    );
+
+    // Check SPF record
+    const txtRecords = await resolveTxt(domain);
+    const hasSpf = txtRecords.some(records => 
+      records.some(record => 
+        record.includes('v=spf1') && 
+        record.includes('include:_spf.boomlify.com')
+      )
+    );
+
+    // Check CNAME record
+    const hasCname = await new Promise((resolve) => {
+      dns.resolveCname(`mail.${domain}`, (err, addresses) => {
+        resolve(!err && addresses?.some(addr => addr.includes('mail.boomlify.com')));
+      });
+    });
+
+    return {
+      isValid: hasMxRecords && hasSpf && hasCname,
+      checks: {
+        mx: hasMxRecords,
+        spf: hasSpf,
+        cname: hasCname
+      }
+    };
+  } catch (error) {
+    console.error('DNS verification error:', error);
+    return {
+      isValid: false,
+      checks: {
+        mx: false,
+        spf: false,
+        cname: false
+      }
+    };
+  }
+}
 
 // Get all emails (both premium and regular)
 router.get('/emails', authenticateToken, async (req, res) => {
@@ -67,6 +118,42 @@ router.get('/emails', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Failed to fetch emails:', error);
     res.status(500).json({ error: 'Failed to fetch emails' });
+  } finally {
+    connection.release();
+  }
+});
+
+// Set email forwarding
+router.post('/emails/:id/forward', authenticateToken, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const { forwardTo } = req.body;
+
+    if (!forwardTo || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(forwardTo)) {
+      return res.status(400).json({ error: 'Invalid forwarding email' });
+    }
+
+    // Update forwarding address
+    const result = await connection.query(
+      `UPDATE premium_emails 
+       SET forward_to = ?
+       WHERE id = ? AND user_id = ?`,
+      [forwardTo, req.params.id, req.user.id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Email not found' });
+    }
+
+    const [updatedEmail] = await connection.query(
+      'SELECT * FROM premium_emails WHERE id = ?',
+      [req.params.id]
+    );
+
+    res.json(updatedEmail[0]);
+  } catch (error) {
+    console.error('Failed to set email forwarding:', error);
+    res.status(500).json({ error: 'Failed to set email forwarding' });
   } finally {
     connection.release();
   }
