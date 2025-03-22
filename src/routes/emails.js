@@ -25,42 +25,52 @@ router.get('/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Get received emails for a specific temporary email with pagination
+// Get received emails for a specific temporary email with progressive loading
 router.get('/:id/received', authenticateToken, async (req, res) => {
   try {
+    // First check if the temp email belongs to the user
+    const [tempEmails] = await pool.query(
+      'SELECT id FROM temp_emails WHERE id = ? AND user_id = ?',
+      [req.params.id, req.user.id]
+    );
+
+    if (tempEmails.length === 0) {
+      return res.status(404).json({ error: 'Email not found' });
+    }
+
     // Get pagination parameters with defaults
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
+    const limit = Math.min(parseInt(req.query.limit) || 10, 25); // Cap at max 25 per request
     const offset = (page - 1) * limit;
 
-    // First get the total count
-    const [countResult] = await pool.query(`
-      SELECT COUNT(*) as total
-      FROM received_emails re
-      JOIN temp_emails te ON re.temp_email_id = te.id
-      WHERE te.id = ? AND te.user_id = ?
-    `, [req.params.id, req.user.id]);
+    // Get count for pagination first
+    const [countResult] = await pool.query(
+      'SELECT COUNT(*) as total FROM received_emails WHERE temp_email_id = ?',
+      [req.params.id]
+    );
+    const total = countResult[0].total;
 
-    const totalCount = countResult[0].total;
-
-    // Then get the paginated data
+    // Efficient query with limited fields for faster response
     const [emails] = await pool.query(`
-      SELECT re.*, te.email as temp_email
-      FROM received_emails re
-      JOIN temp_emails te ON re.temp_email_id = te.id
-      WHERE te.id = ? AND te.user_id = ?
-      ORDER BY re.received_at DESC
+      SELECT 
+        id, subject, from_email, received_at, has_attachments, snippet 
+      FROM 
+        received_emails 
+      WHERE 
+        temp_email_id = ? 
+      ORDER BY 
+        received_at DESC 
       LIMIT ? OFFSET ?
-    `, [req.params.id, req.user.id, limit, offset]);
+    `, [req.params.id, limit, offset]);
 
-    // Return the data with pagination metadata
+    // Return with pagination metadata
     res.json({
       data: emails,
       metadata: {
-        total: totalCount,
-        page: page,
-        limit: limit,
-        pages: Math.ceil(totalCount / limit)
+        total,
+        page,
+        limit,
+        pages: Math.ceil(total / limit)
       }
     });
   } catch (error) {
@@ -149,53 +159,66 @@ router.delete('/delete/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Get user emails with pagination
+// Get user emails with pagination and performance optimizations
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    // Get pagination parameters with defaults
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
+    // Get pagination parameters with defaults and security limits
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50); // Cap at 50 max
     const offset = (page - 1) * limit;
     const search = req.query.search || '';
 
-    // First get the total count with search
-    let countQuery = 'SELECT COUNT(*) as total FROM temp_emails WHERE user_id = ?';
-    let countParams = [req.user.id];
+    // Use connection pool efficiently
+    const connection = await pool.getConnection();
     
-    // Add search condition if search term is provided
-    if (search) {
-      countQuery += ' AND email LIKE ?';
-      countParams.push(`%${search}%`);
-    }
-    
-    const [countResult] = await pool.query(countQuery, countParams);
-    const totalCount = countResult[0].total;
-
-    // Then get the paginated data with search
-    let dataQuery = 'SELECT * FROM temp_emails WHERE user_id = ?';
-    let dataParams = [req.user.id];
-    
-    // Add search condition if search term is provided
-    if (search) {
-      dataQuery += ' AND email LIKE ?';
-      dataParams.push(`%${search}%`);
-    }
-    
-    dataQuery += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    dataParams.push(limit, offset);
-    
-    const [emails] = await pool.query(dataQuery, dataParams);
-
-    // Return the data with pagination metadata
-    res.json({
-      data: emails,
-      metadata: {
-        total: totalCount,
-        page: page,
-        limit: limit,
-        pages: Math.ceil(totalCount / limit)
+    try {
+      // First get the total count with search
+      let countQuery = 'SELECT COUNT(*) as total FROM temp_emails WHERE user_id = ?';
+      let countParams = [req.user.id];
+      
+      // Add search condition if search term is provided
+      if (search) {
+        countQuery += ' AND email LIKE ?';
+        countParams.push(`%${search}%`);
       }
-    });
+      
+      const [countResult] = await connection.query(countQuery, countParams);
+      const totalCount = countResult[0].total;
+  
+      // Then get the paginated data with search - select only needed fields
+      let dataQuery = `
+        SELECT id, email, created_at, expires_at, latest_message_at
+        FROM temp_emails 
+        WHERE user_id = ?
+      `;
+      let dataParams = [req.user.id];
+      
+      // Add search condition if search term is provided
+      if (search) {
+        dataQuery += ' AND email LIKE ?';
+        dataParams.push(`%${search}%`);
+      }
+      
+      dataQuery += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+      dataParams.push(limit, offset);
+      
+      const [emails] = await connection.query(dataQuery, dataParams);
+  
+      // Return the data with pagination metadata and cache headers
+      res.set('Cache-Control', 'private, max-age=5'); // Cache for 5 seconds
+      res.json({
+        data: emails,
+        metadata: {
+          total: totalCount,
+          page: page,
+          limit: limit,
+          pages: Math.ceil(totalCount / limit)
+        }
+      });
+    } finally {
+      // Always release the connection when done
+      connection.release();
+    }
   } catch (error) {
     console.error('Failed to fetch emails:', error);
     res.status(400).json({ error: 'Failed to fetch emails' });
