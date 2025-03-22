@@ -6,7 +6,7 @@ import compression from 'compression';
 import { initializeDatabase, checkDatabaseConnection, pool } from './db/init.js';
 import { cleanupOldEmails } from './utils/cleanup.js';
 import { requestTrackerMiddleware } from './middleware/requestTracker.js';
-import { checkBlockedIp } from './middleware/ipBlocker.js';
+import { checkBlockedIp } from './middleware/ipBlocker.js'; // Added import
 import authRoutes from './routes/auth.js';
 import emailRoutes from './routes/emails.js';
 import domainRoutes from './routes/domains.js';
@@ -14,8 +14,9 @@ import webhookRoutes from './routes/webhook.js';
 import messageRoutes from './routes/messages.js';
 import blogRoutes from './routes/blog.js';
 import monitorRoutes from './routes/monitor.js';
-import premiumRoutes from './routes/premium.js'; // Added premium routes
 import nodemailer from 'nodemailer';
+import morgan from 'morgan';
+import rateLimit from 'express-rate-limit';
 
 dotenv.config();
 
@@ -26,13 +27,13 @@ const port = process.env.PORT || 3000;
 export const mailTransporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
   port: parseInt(process.env.SMTP_PORT || '587'),
-  secure: false,
+  secure: false, // Use TLS
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS
   },
   tls: {
-    rejectUnauthorized: false
+    rejectUnauthorized: false // Only use this in development!
   }
 });
 
@@ -68,7 +69,7 @@ app.use(compression());
 app.use(requestTrackerMiddleware);
 
 // Apply IP blocker to all routes except monitor routes
-app.use(/^(?!\/monitor).*$/, checkBlockedIp);
+app.use(/^(?!\/monitor).*$/, checkBlockedIp); // Added IP blocker middleware
 
 // Security headers
 app.use((req, res, next) => {
@@ -79,13 +80,14 @@ app.use((req, res, next) => {
   next();
 });
 
-// Update CORS configuration
+// Updated CORS configuration with timeouts
 app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Admin-Access'],
-  credentials: true,
-  exposedHeaders: ['Content-Length', 'X-Requested-With', 'X-Request-ID']
+  origin: process.env.NODE_ENV === 'production' 
+    ? [process.env.FRONTEND_URL, 'https://boomlify.com'] 
+    : '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400 // Cache preflight request results for 24 hours
 }));
 
 app.use(express.json());
@@ -116,9 +118,8 @@ app.use('/webhook', webhookRoutes);
 app.use('/messages', messageRoutes);
 app.use('/blog', blogRoutes);
 app.use('/monitor', monitorRoutes);
-app.use('/premium', premiumRoutes); // Added premium routes
 
-// Handle preflight requests
+// Handle preflight requests for /admin/all
 app.options('/emails/admin/all', cors());
 
 // Schedule cleanup
@@ -145,6 +146,47 @@ initializeDatabase().then(() => {
 }).catch(error => {
   console.error('Failed to initialize database:', error);
   process.exit(1);
+});
+
+// Improved rate limiting configuration
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 60, // 60 requests per minute
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many requests, please try again later.',
+  skip: (req) => {
+    // Don't rate limit health check endpoint
+    return req.path === '/health';
+  }
+});
+
+// More restrictive rate limiting for email creation
+const emailCreationLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 20, // 20 email creations per hour
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many email creation requests, please try again later.',
+  keyGenerator: (req) => {
+    // Use user ID if available, otherwise IP
+    return req.user?.id || req.ip;
+  }
+});
+
+// Apply rate limiting to all requests
+app.use(apiLimiter);
+
+// Apply more restrictive rate limiting to email creation
+app.use('/api/emails/create', emailCreationLimiter);
+
+// Request timeout middleware
+app.use((req, res, next) => {
+  // Set a 30-second timeout for all requests
+  req.setTimeout(30000, () => {
+    res.status(408).json({ error: 'Request timeout' });
+  });
+  next();
 });
 
 export default app;
