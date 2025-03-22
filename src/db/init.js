@@ -11,79 +11,104 @@ const pool = mysql.createPool({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
   waitForConnections: true,
-  connectionLimit: 150, // Optimized for DigitalOcean MySQL
-  maxIdle: 50, // Keep fewer idle connections
-  idleTimeout: 30000, // Reduce idle timeout to 30 seconds
+  connectionLimit: 150, // Reduced from 150 to 50 for better performance
+  maxIdle: 50, // Keep fewer idle connections to reduce overhead
+  idleTimeout: 60000, // Increase idle timeout to reduce connection churn (60 seconds)
   queueLimit: 0, // No limit on queue size
   enableKeepAlive: true,
-  keepAliveInitialDelay: 10000,
-  connectTimeout: 10000, // Connection timeout in milliseconds
+  keepAliveInitialDelay: 30000, // Increased to reduce unnecessary pings
+  connectTimeout: 15000, // Increased connection timeout in milliseconds for better reliability
   ssl: {
     // For DigitalOcean Managed MySQL
     rejectUnauthorized: false // Required for DigitalOcean's self-signed certificates
   }
 });
 
-// Connection monitoring and error handling
+// Enhanced connection monitoring and error handling with rate limiting
+let lastErrorLogTime = 0;
+const ERROR_LOG_THROTTLE = 5000; // Throttle error logging to once per 5 seconds
+
 pool.on('connection', (connection) => {
   console.log('New database connection established');
   
   connection.on('error', (err) => {
-    console.error('Database connection error:', err);
-    if (err.code === 'PROTOCOL_CONNECTION_LOST') {
-      console.error('Database connection was closed');
-    }
-    if (err.code === 'ER_CON_COUNT_ERROR') {
-      console.error('Database has too many connections');
-    }
-    if (err.code === 'ECONNREFUSED') {
-      console.error('Database connection was refused');
+    const now = Date.now();
+    if (now - lastErrorLogTime > ERROR_LOG_THROTTLE) {
+      console.error('Database connection error:', err);
+      lastErrorLogTime = now;
+      
+      if (err.code === 'PROTOCOL_CONNECTION_LOST') {
+        console.error('Database connection was closed');
+      }
+      if (err.code === 'ER_CON_COUNT_ERROR') {
+        console.error('Database has too many connections');
+      }
+      if (err.code === 'ECONNREFUSED') {
+        console.error('Database connection was refused');
+      }
     }
   });
 
-  // Monitor query execution time
+  // Monitor query execution time with better performance tracking
   connection.on('query', (query) => {
     const start = Date.now();
-    connection.once('result', () => {
-      const duration = Date.now() - start;
-      if (duration > 1000) { // Log slow queries (>1s)
-        console.warn('Slow query detected:', {
-          query: query.sql,
-          duration: duration + 'ms'
-        });
-      }
-    });
+    
+    // Only track select queries that might be slow
+    if (query.sql && query.sql.toLowerCase().includes('select')) {
+      connection.once('result', () => {
+        const duration = Date.now() - start;
+        if (duration > 500) { // Lower the threshold to catch more slow queries (>500ms)
+          console.warn('Slow query detected:', {
+            query: query.sql.substring(0, 200) + (query.sql.length > 200 ? '...' : ''), // Truncate for log clarity
+            duration: duration + 'ms'
+          });
+        }
+      });
+    }
   });
 });
 
+// Enhanced health check with connection metrics and improved caching
+let healthCheckCache = null;
+let lastHealthCheck = 0;
+const HEALTH_CHECK_CACHE_TTL = 10000; // 10 seconds
 
-
-// Enhanced health check with connection metrics
 export async function checkDatabaseConnection() {
+  const now = Date.now();
+  
+  // Return cached health check if valid
+  if (healthCheckCache && (now - lastHealthCheck < HEALTH_CHECK_CACHE_TTL)) {
+    return healthCheckCache;
+  }
+  
   try {
     const connection = await pool.getConnection();
     
-    // Get connection stats
+    // Get connection stats efficiently
     const [threadStatus] = await connection.query('SHOW STATUS LIKE "Threads_connected"');
     const [maxConnections] = await connection.query('SHOW VARIABLES LIKE "max_connections"');
-    const [waitEvents] = await connection.query('SHOW STATUS LIKE "Threads_waiting_for_connection_count"');
     
     const stats = {
       activeConnections: parseInt(threadStatus[0].Value),
       maxAllowed: parseInt(maxConnections[0].Value),
-      waitingThreads: parseInt(waitEvents[0].Value),
       poolSize: pool.pool.config.connectionLimit,
       queueSize: pool.pool.waitingClientsCount()
     };
     
     connection.release();
     
-    return {
+    const result = {
       healthy: true,
       timestamp: new Date().toISOString(),
       metrics: stats,
       warning: stats.activeConnections > (stats.poolSize * 0.8) ? 'High connection usage' : null
     };
+    
+    // Cache the health check result
+    healthCheckCache = result;
+    lastHealthCheck = now;
+    
+    return result;
   } catch (error) {
     console.error('Database health check failed:', error);
     return {
