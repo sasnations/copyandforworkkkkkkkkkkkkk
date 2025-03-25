@@ -1,4 +1,6 @@
 import { pool } from '../db/init.js';
+import nodemailer from 'nodemailer';
+import { mailTransporter } from '../index.js';
 
 export class EmailRouter {
   async getRoutingInfo(recipientEmail) {
@@ -50,22 +52,70 @@ export class EmailRouter {
       throw new Error('Invalid recipient domain');
     }
 
-    if (routing.type === 'custom' && routing.forwardTo) {
-      // Forward email to user's specified address
-      await this.forwardEmail(emailData, routing.forwardTo);
-      
-      // Store in received_emails table
+    // Get the temp email details
+    const connection = await pool.getConnection();
+    try {
+      const [tempEmail] = await connection.query(
+        'SELECT * FROM temp_emails WHERE email = ?',
+        [recipientEmail]
+      );
+
+      if (tempEmail.length === 0) {
+        throw new Error('Temporary email not found');
+      }
+
+      // If there's a forward address, forward the email
+      if (routing.type === 'custom' && routing.forwardTo) {
+        await this.forwardEmail(
+          recipientEmail,
+          routing.forwardTo,
+          emailData.from,
+          emailData.subject,
+          emailData.html || emailData.text,
+          emailData.attachments
+        );
+      }
+
+      // Store the email regardless of forwarding
       await this.storeEmail(emailData, routing.userId);
-    } else {
-      // Handle system domain email
-      await this.storeEmail(emailData);
+
+    } catch (error) {
+      console.error('Error handling incoming email:', error);
+      throw error;
+    } finally {
+      connection.release();
     }
   }
 
-  async forwardEmail(emailData, forwardTo) {
-    // Use your existing mail transport to forward the email
-    // This is just a placeholder - implement according to your mail server setup
-    console.log(`Forwarding email to ${forwardTo}`, emailData);
+  async forwardEmail(fromEmail, toEmail, originalSender, subject, content, attachments = []) {
+    try {
+      // Create email options
+      const mailOptions = {
+        from: fromEmail, // Send from the temp email address
+        to: toEmail,
+        subject: subject,
+        html: content,
+        attachments: attachments.map(attachment => ({
+          filename: attachment.filename,
+          content: attachment.content,
+          contentType: attachment.contentType
+        })),
+        // Preserve original sender information in headers
+        headers: {
+          'X-Original-From': originalSender,
+          'X-Forwarded-By': 'Boomlify Mail Service'
+        },
+        // Enable reply to original sender
+        replyTo: originalSender
+      };
+
+      // Send the email using the configured transporter
+      await mailTransporter.sendMail(mailOptions);
+
+    } catch (error) {
+      console.error('Failed to forward email:', error);
+      throw error;
+    }
   }
 
   async storeEmail(emailData, userId = null) {
