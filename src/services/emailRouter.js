@@ -33,9 +33,16 @@ export class EmailRouter {
       );
 
       if (systemDomain.length > 0) {
+        // Check if there's a forwarding rule for this email
+        const [forwardRule] = await connection.query(
+          'SELECT forward_to FROM email_forwards WHERE email = ?',
+          [recipientEmail]
+        );
+
         return {
           type: 'system',
-          domain: systemDomain[0]
+          domain: systemDomain[0],
+          forwardTo: forwardRule.length > 0 ? forwardRule[0].forward_to : null
         };
       }
 
@@ -52,20 +59,16 @@ export class EmailRouter {
       throw new Error('Invalid recipient domain');
     }
 
-    // Get the temp email details
     const connection = await pool.getConnection();
     try {
+      // Get the temp email details
       const [tempEmail] = await connection.query(
         'SELECT * FROM temp_emails WHERE email = ?',
         [recipientEmail]
       );
 
-      if (tempEmail.length === 0) {
-        throw new Error('Temporary email not found');
-      }
-
-      // If there's a forward address, forward the email
-      if (routing.type === 'custom' && routing.forwardTo) {
+      // Forward email if there's a forwarding rule (for both custom and system domains)
+      if (routing.forwardTo) {
         await this.forwardEmail(
           recipientEmail,
           routing.forwardTo,
@@ -76,8 +79,8 @@ export class EmailRouter {
         );
       }
 
-      // Store the email regardless of forwarding
-      await this.storeEmail(emailData, routing.userId);
+      // Store the email in received_emails table
+      await this.storeEmail(emailData, routing.userId || tempEmail[0]?.user_id);
 
     } catch (error) {
       console.error('Error handling incoming email:', error);
@@ -91,7 +94,7 @@ export class EmailRouter {
     try {
       // Create email options
       const mailOptions = {
-        from: fromEmail, // Send from the temp email address
+        from: fromEmail,
         to: toEmail,
         subject: subject,
         html: content,
@@ -100,12 +103,10 @@ export class EmailRouter {
           content: attachment.content,
           contentType: attachment.contentType
         })),
-        // Preserve original sender information in headers
         headers: {
           'X-Original-From': originalSender,
           'X-Forwarded-By': 'Boomlify Mail Service'
         },
-        // Enable reply to original sender
         replyTo: originalSender
       };
 
@@ -124,11 +125,38 @@ export class EmailRouter {
       await connection.beginTransaction();
 
       // Store email in received_emails table
-      const emailId = await this.insertEmail(connection, emailData, userId);
+      const [result] = await connection.query(
+        `INSERT INTO received_emails (
+          id, temp_email_id, from_email, from_name, subject, 
+          body_html, body_text, received_at, user_id
+        ) VALUES (UUID(), ?, ?, ?, ?, ?, ?, NOW(), ?)`,
+        [
+          emailData.tempEmailId,
+          emailData.from,
+          emailData.fromName,
+          emailData.subject,
+          emailData.html,
+          emailData.text,
+          userId
+        ]
+      );
 
       // Store attachments if any
       if (emailData.attachments?.length) {
-        await this.insertAttachments(connection, emailId, emailData.attachments);
+        for (const attachment of emailData.attachments) {
+          await connection.query(
+            `INSERT INTO email_attachments (
+              id, email_id, filename, content_type, size, content
+            ) VALUES (UUID(), ?, ?, ?, ?, ?)`,
+            [
+              result.insertId,
+              attachment.filename,
+              attachment.contentType,
+              attachment.size,
+              attachment.content
+            ]
+          );
+        }
       }
 
       await connection.commit();
@@ -137,42 +165,6 @@ export class EmailRouter {
       throw error;
     } finally {
       connection.release();
-    }
-  }
-
-  async insertEmail(connection, emailData, userId) {
-    const [result] = await connection.query(
-      `INSERT INTO received_emails (
-        id, temp_email_id, from_email, from_name, subject, 
-        body_html, body_text, received_at, user_id
-      ) VALUES (UUID(), ?, ?, ?, ?, ?, ?, NOW(), ?)`,
-      [
-        emailData.tempEmailId,
-        emailData.from,
-        emailData.fromName,
-        emailData.subject,
-        emailData.html,
-        emailData.text,
-        userId
-      ]
-    );
-    return result.insertId;
-  }
-
-  async insertAttachments(connection, emailId, attachments) {
-    for (const attachment of attachments) {
-      await connection.query(
-        `INSERT INTO email_attachments (
-          id, email_id, filename, content_type, size, content
-        ) VALUES (UUID(), ?, ?, ?, ?, ?)`,
-        [
-          emailId,
-          attachment.filename,
-          attachment.contentType,
-          attachment.size,
-          attachment.content
-        ]
-      );
     }
   }
 }
