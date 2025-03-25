@@ -3,63 +3,34 @@ import { v4 as uuidv4 } from 'uuid';
 import { pool } from '../db/init.js';
 import { simpleParser } from 'mailparser';
 import iconv from 'iconv-lite';
+import { EmailRouter } from '../services/emailRouter.js';
 
 // Email parsing helper functions
 function extractSenderEmail(emailFrom) {
-  // If no email provided, return empty string
   if (!emailFrom) return '';
-
-  // Try to extract email from format "Name <email@domain.com>"
   const angleEmailMatch = emailFrom.match(/<(.+?)>/);
-  if (angleEmailMatch) {
-    return angleEmailMatch[1];
-  }
-
-  // Try to extract email from format "email@domain.com"
+  if (angleEmailMatch) return angleEmailMatch[1];
   const simpleEmailMatch = emailFrom.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+)/);
-  if (simpleEmailMatch) {
-    return simpleEmailMatch[1];
-  }
-
-  // Handle bounce/system emails
+  if (simpleEmailMatch) return simpleEmailMatch[1];
   if (emailFrom.includes('bounce') || emailFrom.includes('mailer-daemon')) {
-    // Try to extract original sender from common bounce formats
     const bounceMatch = emailFrom.match(/original-sender:\s*([^\s]+@[^\s]+)/i);
-    if (bounceMatch) {
-      return bounceMatch[1];
-    }
-    
-    // If it's a bounce but we can't find original sender, mark it clearly
+    if (bounceMatch) return bounceMatch[1];
     return 'system@bounced.mail';
   }
-
-  // Return original if no pattern matches
   return emailFrom;
 }
 
 function extractSenderName(emailFrom) {
   if (!emailFrom) return 'Unknown Sender';
-
-  // Try to extract name from "Name <email@domain.com>"
   const nameMatch = emailFrom.match(/^"?([^"<]+)"?\s*</);
-  if (nameMatch) {
-    return nameMatch[1].trim();
-  }
-
-  // For bounce messages, return clear system name
-  if (emailFrom.includes('bounce') || emailFrom.includes('mailer-daemon')) {
-    return 'System Notification';
-  }
-
-  // If no name found, use email local part
+  if (nameMatch) return nameMatch[1].trim();
+  if (emailFrom.includes('bounce') || emailFrom.includes('mailer-daemon')) return 'System Notification';
   const email = extractSenderEmail(emailFrom);
   return email.split('@')[0] || 'Unknown Sender';
 }
 
 function cleanSubject(subject) {
   if (!subject) return 'No Subject';
-
-  // Remove common prefixes
   const prefixesToRemove = [
     /^re:\s*/i,
     /^fwd:\s*/i,
@@ -69,48 +40,32 @@ function cleanSubject(subject) {
     /^auto.*reply:\s*/i,
     /^automatic\s+reply:\s*/i
   ];
-
   let cleanedSubject = subject;
   prefixesToRemove.forEach(prefix => {
     cleanedSubject = cleanedSubject.replace(prefix, '');
   });
-
-  // Decode HTML entities
   cleanedSubject = cleanedSubject
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
+    .replace(/"/g, '"')
+    .replace(/&/g, '&')
+    .replace(/</g, '<')
+    .replace(/>/g, '>')
     .replace(/&#(\d+);/g, (match, dec) => String.fromCharCode(dec));
-
-  // Remove excess whitespace
   cleanedSubject = cleanedSubject.replace(/\s+/g, ' ').trim();
-
-  // Limit length
-  if (cleanedSubject.length > 100) {
-    cleanedSubject = cleanedSubject.substring(0, 97) + '...';
-  }
-
+  if (cleanedSubject.length > 100) cleanedSubject = cleanedSubject.substring(0, 97) + '...';
   return cleanedSubject || 'No Subject';
 }
 
 async function parseEmailContent(rawContent) {
   try {
-    // Decode content if needed
     let decodedContent = rawContent;
     if (typeof rawContent === 'string') {
       try {
-        // Try UTF-8 first
         decodedContent = iconv.decode(Buffer.from(rawContent), 'utf8');
       } catch (err) {
-        // Fallback to latin1
         decodedContent = iconv.decode(Buffer.from(rawContent), 'latin1');
       }
     }
-
-    // Parse email using mailparser
     const parsed = await simpleParser(decodedContent);
-
     return {
       headers: parsed.headers,
       subject: parsed.subject,
@@ -140,124 +95,138 @@ async function parseEmailContent(rawContent) {
 }
 
 const router = express.Router();
+const emailRouter = new EmailRouter();
 
-router.post('/email/incoming', express.urlencoded({ extended: true }), async (req, res) => {
-  console.log('Received webhook request');
-  console.log('Content-Type:', req.headers['content-type']);
-  
+// Note: Ensure the following middleware is applied at the app level:
+// app.use(express.urlencoded({ extended: true }));
+// app.use(express.json());
+
+router.post('/email/incoming', async (req, res) => {
   try {
-    const rawContent = req.body.body;
-    const parsedEmail = await parseEmailContent(rawContent);
-    
-    // Extract and clean email data
-    const senderEmail = extractSenderEmail(req.body.sender || parsedEmail.from);
-    const senderName = extractSenderName(req.body.sender || parsedEmail.from);
-    const cleanedSubject = cleanSubject(parsedEmail.subject);
-    
-    const emailData = {
-      recipient: req.body.recipient || parsedEmail.to,
-      sender: senderEmail,
-      senderName: senderName,
-      subject: cleanedSubject,
-      body_html: parsedEmail.html || '',
-      body_text: parsedEmail.text || '',
-      attachments: parsedEmail.attachments || []
-    };
+    const contentType = req.headers['content-type'];
 
-    // Clean the recipient email address
-    const cleanRecipient = emailData.recipient.includes('<') ? 
-      emailData.recipient.match(/<(.+)>/)[1] : 
-      emailData.recipient.trim();
+    if (contentType && contentType.includes('application/x-www-form-urlencoded')) {
+      // Existing logic for urlencoded requests
+      console.log('Received webhook request (urlencoded)');
+      console.log('Content-Type:', contentType);
 
-    // Find the temporary email in the database
-    const [tempEmails] = await pool.query(
-      'SELECT id FROM temp_emails WHERE email = ? AND expires_at > NOW()',
-      [cleanRecipient]
-    );
+      const rawContent = req.body.body;
+      const parsedEmail = await parseEmailContent(rawContent);
 
-    if (tempEmails.length === 0) {
-      console.error('No active temporary email found for recipient:', cleanRecipient);
-      return res.status(404).json({ 
-        error: 'Recipient not found',
-        message: 'No active temporary email found for the specified recipient'
-      });
-    }
+      const senderEmail = extractSenderEmail(req.body.sender || parsedEmail.from);
+      const senderName = extractSenderName(req.body.sender || parsedEmail.from);
+      const cleanedSubject = cleanSubject(parsedEmail.subject);
 
-    const tempEmailId = tempEmails[0].id;
-    const emailId = uuidv4();
+      const emailData = {
+        recipient: req.body.recipient || parsedEmail.to,
+        sender: senderEmail,
+        senderName: senderName,
+        subject: cleanedSubject,
+        body_html: parsedEmail.html || '',
+        body_text: parsedEmail.text || '',
+        attachments: parsedEmail.attachments || []
+      };
 
-    // Start a transaction
-    const connection = await pool.getConnection();
-    await connection.beginTransaction();
+      const cleanRecipient = emailData.recipient.includes('<') ?
+        emailData.recipient.match(/<(.+)>/)[1] :
+        emailData.recipient.trim();
 
-    try {
-      // Store the email
-      await connection.query(`
-        INSERT INTO received_emails (
-          id, 
-          temp_email_id, 
-          from_email,
-          from_name,
-          subject, 
-          body_html,
-          body_text,
-          received_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
-      `, [
-        emailId,
-        tempEmailId,
-        emailData.sender,
-        emailData.senderName,
-        emailData.subject,
-        emailData.body_html,
-        emailData.body_text
-      ]);
+      const [tempEmails] = await pool.query(
+        'SELECT id FROM temp_emails WHERE email = ? AND expires_at > NOW()',
+        [cleanRecipient]
+      );
 
-      // Store attachments if any
-      for (const attachment of emailData.attachments) {
-        const attachmentId = uuidv4();
-        await connection.query(`
-          INSERT INTO email_attachments (
-            id,
-            email_id,
-            filename,
-            content_type,
-            size,
-            content,
-            created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, NOW())
-        `, [
-          attachmentId,
-          emailId,
-          attachment.filename,
-          attachment.contentType,
-          attachment.size,
-          attachment.content
-        ]);
+      if (tempEmails.length === 0) {
+        console.error('No active temporary email found for recipient:', cleanRecipient);
+        return res.status(404).json({
+          error: 'Recipient not found',
+          message: 'No active temporary email found for the specified recipient'
+        });
       }
 
-      await connection.commit();
-      console.log('Email and attachments stored successfully');
+      const tempEmailId = tempEmails[0].id;
+      const emailId = uuidv4();
 
-      res.status(200).json({
-        message: 'Email received and stored successfully',
-        emailId,
-        recipient: cleanRecipient
-      });
-    } catch (error) {
-      await connection.rollback();
-      throw error;
-    } finally {
-      connection.release();
+      const connection = await pool.getConnection();
+      await connection.beginTransaction();
+
+      try {
+        await connection.query(`
+          INSERT INTO received_emails (
+            id, 
+            temp_email_id, 
+            from_email,
+            from_name,
+            subject, 
+            body_html,
+            body_text,
+            received_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+        `, [
+          emailId,
+          tempEmailId,
+          emailData.sender,
+          emailData.senderName,
+          emailData.subject,
+          emailData.body_html,
+          emailData.body_text
+        ]);
+
+        for (const attachment of emailData.attachments) {
+          const attachmentId = uuidv4();
+          await connection.query(`
+            INSERT INTO email_attachments (
+              id,
+              email_id,
+              filename,
+              content_type,
+              size,
+              content,
+              created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NOW())
+          `, [
+            attachmentId,
+            emailId,
+            attachment.filename,
+            attachment.contentType,
+            attachment.size,
+            attachment.content
+          ]);
+        }
+
+        await connection.commit();
+        console.log('Email and attachments stored successfully');
+
+        res.status(200).json({
+          message: 'Email received and stored successfully',
+          emailId,
+          recipient: cleanRecipient
+        });
+      } catch (error) {
+        await connection.rollback();
+        throw error;
+      } finally {
+        connection.release();
+      }
+    } else if (contentType && contentType.includes('application/json')) {
+      // New logic for JSON requests
+      console.log('Received webhook request (JSON)');
+      console.log('Content-Type:', contentType);
+
+      const emailData = req.body;
+      const recipient = emailData.recipient || emailData.to;
+      if (!recipient) {
+        throw new Error('No recipient specified');
+      }
+
+      await emailRouter.handleIncomingEmail(recipient, emailData);
+      res.json({ status: 'success', message: 'Email processed successfully' });
+    } else {
+      res.status(400).json({ error: 'Unsupported content type' });
     }
   } catch (error) {
-    console.error('Webhook processing error:', error);
-    console.error('Error stack:', error.stack);
-    
-    res.status(500).json({
-      error: 'Internal server error',
-      message: 'Failed to process the incoming email'
-    });
+    console.error('Failed to process incoming email:', error);
+    res.status(500).json({ error: 'Failed to process email' });
   }
 });
 
