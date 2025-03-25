@@ -18,11 +18,27 @@ router.get('/public', async (req, res) => {
   }
 });
 
-// Get all domains (protected route)
+// Get all domains (protected route) - Modified version
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const [domains] = await pool.query('SELECT * FROM domains ORDER BY created_at DESC');
-    res.json(domains);
+    // Get both system domains and user's custom domains
+    const [systemDomains] = await pool.query('SELECT * FROM domains');
+    const [customDomains] = await pool.query(
+      'SELECT * FROM user_domains WHERE user_id = ? AND is_verified = 1',
+      [req.user.id]
+    );
+
+    // Combine and format domains
+    const allDomains = [
+      ...systemDomains,
+      ...customDomains.map(d => ({
+        id: d.id,
+        domain: d.domain,
+        isCustom: true
+      }))
+    ];
+
+    res.json(allDomains);
   } catch (error) {
     console.error('Failed to fetch domains:', error);
     res.status(500).json({ error: 'Failed to fetch domains' });
