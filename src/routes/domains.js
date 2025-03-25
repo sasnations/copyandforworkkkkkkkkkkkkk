@@ -18,7 +18,7 @@ router.get('/public', async (req, res) => {
   }
 });
 
-// Get all domains (protected route - added from second code)
+// Get all domains (protected route)
 router.get('/', authenticateToken, async (req, res) => {
   try {
     const [domains] = await pool.query('SELECT * FROM domains ORDER BY created_at DESC');
@@ -115,9 +115,15 @@ router.post('/custom', authenticateToken, async (req, res) => {
   }
 });
 
-// Add domain (admin only - added from second code)
-router.post('/add', authenticateToken, requireAdmin, async (req, res) => {
+// Add domain (admin only)
+router.post('/add', authenticateToken, async (req, res) => {
   try {
+    // Check admin access
+    const adminAccess = req.headers['admin-access'];
+    if (adminAccess !== process.env.ADMIN_PASSPHRASE && !req.user?.isAdmin) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
     const { domain } = req.body;
     const id = uuidv4();
 
